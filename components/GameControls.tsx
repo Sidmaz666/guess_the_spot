@@ -36,7 +36,7 @@ export default function GameControls({
             className="px-8 py-4 bg-gradient-to-r from-emerald-600 to-emerald-500 text-white font-semibold rounded-xl text-lg transition-all duration-300 hover:shadow-2xl hover:shadow-emerald-500/50 hover:scale-105 active:scale-95 focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 focus:ring-offset-slate-900/40 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:shadow-none cursor-pointer"
           >
             <span className="flex items-center justify-center gap-2">
-              {playerGuess ? '✅ Check Guess' : '📍 Make a Guess First'}
+              {playerGuess ? 'Check Guess' : '📍 Make a Guess First'}
             </span>
           </button>
         ) : null}
