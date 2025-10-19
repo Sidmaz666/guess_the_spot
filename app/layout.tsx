@@ -38,35 +38,24 @@ export const metadata: Metadata = {
     address: false,
     telephone: false,
   },
-  metadataBase: new URL("https://guessthespot.vercel.app"),
+  metadataBase: new URL("https://guess-the-spot.vercel.app"),
   alternates: {
     canonical: "/",
   },
   openGraph: {
     type: "website",
     locale: "en_US",
-    url: "https://guessthespot.vercel.app",
+    url: "https://guess-the-spot.vercel.app",
     title: "Guess the Spot - Interactive Geography Game",
     description: "Test your geography knowledge! Look at real images from around the world and guess their location on an interactive map.",
     siteName: "Guess the Spot",
     images: [
       {
-        url: "/preview.png",
+        url: "https://guess-the-spot.vercel.app/preview.png",
         width: 1200,
         height: 630,
         alt: "Guess the Spot - Interactive Geography Game Landing Page",
-      },
-      {
-        url: "/preview_game.png",
-        width: 1200,
-        height: 630,
-        alt: "Guess the Spot - Game Interface with Interactive Map",
-      },
-      {
-        url: "/preview_result.png",
-        width: 1200,
-        height: 630,
-        alt: "Guess the Spot - Results Screen with Scoring",
+        type: "image/png",
       },
     ],
   },
@@ -74,7 +63,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Guess the Spot - Interactive Geography Game",
     description: "Test your geography knowledge! Look at real images from around the world and guess their location on an interactive map.",
-    images: ["/preview.png", "/preview_game.png", "/preview_result.png"],
+    images: ["https://guess-the-spot.vercel.app/preview.png"],
     creator: "@Sidmaz666",
   },
   robots: {
