@@ -24,6 +24,7 @@ const loadingMessages = [
 
 export default function ImageDisplay({ gameData, isLoading }: ImageDisplayProps) {
   const [currentMessageIndex, setCurrentMessageIndex] = useState(0);
+  const [imageError, setImageError] = useState(false);
 
   useEffect(() => {
     if (isLoading) {
@@ -33,6 +34,10 @@ export default function ImageDisplay({ gameData, isLoading }: ImageDisplayProps)
       return () => clearInterval(interval);
     }
   }, [isLoading]);
+
+  useEffect(() => {
+    setImageError(false);
+  }, [gameData?.image?.fileurl]);
 
   if (isLoading) {
     return (
@@ -62,14 +67,15 @@ export default function ImageDisplay({ gameData, isLoading }: ImageDisplayProps)
     );
   }
 
-  if (!gameData || !gameData.image) {
+  if (!gameData || !gameData.image || imageError) {
     return (
       <div className="flex items-center justify-center h-full">
         <div className="text-center text-slate-400">
           <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-slate-800 flex items-center justify-center">
-            <span className="text-2xl">🖼️</span>
+            <span className="text-2xl">🗺️</span>
           </div>
           <p className="text-lg">No image available</p>
+          <p className="text-sm text-slate-500 mt-2">Use your map skills to find this spot!</p>
         </div>
       </div>
     );
@@ -87,6 +93,7 @@ export default function ImageDisplay({ gameData, isLoading }: ImageDisplayProps)
           className="object-cover"
           sizes="(max-width: 768px) 100vw, 50vw"
           priority
+          onError={() => setImageError(true)}
         />
         <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-slate-900/20 pointer-events-none" />
       </div>

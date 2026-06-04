@@ -1,18 +1,22 @@
 import axios from 'axios';
 
-// Environment variables with fallbacks
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
 const WIKIMEDIA_BASE_URL = process.env.WIKIMEDIA_BASE_URL || 'https://commons.wikimedia.org/w/api.php';
-const WIKIMEDIA_USER_AGENT = process.env.WIKIMEDIA_USER_AGENT || 'GuessTheSpot (contact@example.com)';
-const WIKIMEDIA_REFERER = process.env.WIKIMEDIA_REFERER || 'https://guessthespot.app';
+const WIKIPEDIA_BASE_URL = process.env.WIKIPEDIA_BASE_URL || 'https://en.wikipedia.org/w/api.php';
 const OPENVERSE_BASE_URL = process.env.OPENVERSE_BASE_URL || 'https://api.openverse.org/v1/images';
 
-interface Place {
-  lat: number;
-  lon: number;
-  // Other fields like country, city, etc., can be added as needed
-}
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_CX = process.env.GOOGLE_CX;
+const BING_API_KEY = process.env.BING_API_KEY;
+const PEXELS_API_KEY = process.env.PEXELS_API_KEY;
+const PIXABAY_API_KEY = process.env.PIXABAY_API_KEY;
 
-
+// ============================================================
+// TYPES
+// ============================================================
 
 interface Photo {
   id: number;
@@ -26,753 +30,752 @@ interface Photo {
   width?: number;
   height?: number;
   size?: number;
-  timestamp?: string;
-  // Additional metadata from Wikimedia
-  pageId?: number;
-  namespace?: number;
-  coordinates?: {
-    lat: number;
-    lon: number;
-    primary?: boolean;
-    globe?: string;
+  coordinates?: { lat: number; lon: number; primary?: boolean; globe?: string };
+}
+
+interface Stage {
+  name: string;
+  fn: () => Promise<Photo | null>;
+  timeout: number;
+  skip?: boolean;
+}
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const JUNK_PATTERNS = [
+  'encrypted-tbn0.gstatic.com', 'images.google.com/tbn', 'th?id=', 'tbn:',
+  'google.com/images/spinner', 'data:image', 'base64,', 'googlelogo',
+  'favicon', 'pixel', 'google.com/logo', 'gstatic.com', '1x1.gif',
+  'placeholder', 'spacer', 'blank.gif', 'transparent',
+  // CDN-protected / stock photo agencies that block hotlinking
+  'alamy.com', 'alamyimg.com', 'istockphoto.com', 'gettyimages.com',
+  '.shutterstock.com', 'dreamstime.com', '123rf.com', 'depositphotos.com',
+  'canstockphoto.com', 'bigstockphoto.com', 'corbis.com',
+  'agefotostock.com', 'superstock.com', 'stock.adobe.com',
+  'stockphoto.com', 'dissolve.com', 'offset.com',
+];
+
+const GENERIC_TITLE_PATTERNS = [
+  'view of earth', 'iss photo', 'satellite image', 'satellite view',
+  'map of', 'diagram', 'location map', 'blank map', 'orthographic',
+  'flag of', 'coat of arms', 'emblem', 'seal of',
+  'logo', 'icon', 'symbol', 'wikidata', 'nasa image',
+  'illustration of', 'stock photo', 'placeholder',
+  'world map', 'globe view',
+];
+
+const GENERIC_URL_PATTERNS = [
+  '-map.', '-map-', '/map.', 'maps.google', 'openstreetmap',
+  'wikimedia.org/map', 'mapbox',
+];
+
+// ============================================================
+// UTILITY
+// ============================================================
+
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+];
+const randomUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function isJunkUrl(url: string): boolean {
+  if (JUNK_PATTERNS.some(p => url.toLowerCase().includes(p))) return true;
+  if (GENERIC_URL_PATTERNS.some(p => url.toLowerCase().includes(p))) return true;
+  return false;
+}
+
+function isGenericTitle(title?: string): boolean {
+  if (!title) return true;
+  const lower = title.toLowerCase();
+  return GENERIC_TITLE_PATTERNS.some(p => lower.includes(p));
+}
+
+function countLocationTerms(title: string | undefined, terms: string[]): number {
+  if (!title) return 0;
+  const lower = title.toLowerCase();
+  return terms.filter(t => lower.includes(t)).length;
+}
+
+function getLocationTerms(location?: any): string[] {
+  if (!location) return [];
+  const terms: string[] = [];
+  const add = (v?: string) => { if (v && v.length > 2) terms.push(v.toLowerCase()); };
+  add(location.city); add(location.state); add(location.country); add(location.localName);
+  return terms;
+}
+
+function resolveUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.endsWith('duckduckgo.com') && parsed.pathname === '/iu/') {
+      const orig = parsed.searchParams.get('u');
+      if (orig) return decodeURIComponent(orig);
+    }
+    if (parsed.hostname.includes('googleusercontent.com')) {
+      return url.replace(/=w\d+-h\d+(-c)?$/, '').replace(/=s\d+$/, '');
+    }
+  } catch { }
+  return url;
+}
+
+function createPhotoObject(pageId: string | number, page: any, coords: any, imageInfo: any): Photo {
+  const ext = imageInfo.extmetadata || {};
+  return {
+    id: typeof pageId === 'string' ? parseInt(pageId) || 0 : pageId,
+    lat: parseFloat(coords.lat), lng: parseFloat(coords.lon),
+    fileurl: imageInfo.url, title: page.title,
+    description: ext.ImageDescription?.value || ext.ObjectName?.value,
+    author: ext.Artist?.value || ext.Credit?.value || ext.Author?.value,
+    license: ext.LicenseShortName?.value || ext.License?.value,
+    width: imageInfo.width, height: imageInfo.height, size: imageInfo.size,
+    coordinates: { lat: parseFloat(coords.lat), lon: parseFloat(coords.lon), primary: coords.primary, globe: coords.globe },
   };
 }
 
-// Openverse API interfaces
-interface OpenverseImage {
-  id: string;
-  title: string;
-  indexed_on: string;
-  foreign_landing_url: string;
-  url: string;
-  creator: string;
-  creator_url: string;
-  license: string;
-  license_version: string;
-  license_url: string;
-  provider: string;
-  source: string;
-  category: string | null;
-  filesize: number | null;
-  filetype: string | null;
-  tags: Array<{
-    name: string;
-    accuracy: number | null;
-    unstable__provider: string;
-  }>;
-  attribution: string;
-  fields_matched: string[];
-  mature: boolean;
-  height: number;
-  width: number;
-  thumbnail: string;
-  detail_url: string;
-  related_url: string;
-  unstable__sensitivity: any[];
+function createPhotoFromUrl(url: string, lat: number, lon: number, title?: string, author?: string, width?: number, height?: number): Photo {
+  return { id: Math.floor(Math.random() * 2147483647), lat, lng: lon, fileurl: url, title, author, width, height, coordinates: { lat, lon, primary: true, globe: 'earth' } };
 }
 
-interface OpenverseResponse {
-  result_count: number;
-  page_count: number;
-  page_size: number;
-  page: number;
-  results: OpenverseImage[];
+async function verifyImageUrl(url: string, timeoutMs = 3000): Promise<boolean> {
+  try {
+    const resp = await axios.head(url, {
+      headers: { 'User-Agent': randomUA(), 'Accept': 'image/webp,image/*,*/*', 'Range': 'bytes=0-0' },
+      timeout: timeoutMs,
+      validateStatus: s => s >= 200 && s < 400,
+      maxRedirects: 3,
+    });
+    return true;
+  } catch {
+    // Some CDNs reject HEAD — try a tiny GET
+    try {
+      const resp = await axios.get(url, {
+        headers: { 'User-Agent': randomUA(), 'Accept': 'image/webp,image/*,*/*', 'Range': 'bytes=0-0' },
+        timeout: timeoutMs,
+        validateStatus: s => s >= 200 && s < 400,
+        maxRedirects: 3,
+        responseType: 'stream',
+      });
+      resp.data.destroy();
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
-async function fetchWithUA(url: string, retries: number = 3): Promise<any> {
+async function fetchWithUA(url: string, retries = 3, timeoutMs = 10000): Promise<any> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await axios.get(url, {
-        headers: {
-          'User-Agent': WIKIMEDIA_USER_AGENT,
-          'Referer': WIKIMEDIA_REFERER,
-          'Accept': 'application/json',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-        timeout: 10000, // 10 second timeout
-        validateStatus: function (status) {
-          return status >= 200 && status < 300; // Only resolve for 2xx status codes
-        }
+        headers: { 'User-Agent': randomUA(), Accept: 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9' },
+        timeout: timeoutMs,
+        validateStatus: s => s >= 200 && s < 300,
       });
-      
       return response.data;
     } catch (error: any) {
-      console.warn(`Wikimedia API attempt ${attempt} failed for ${url}:`, error.message);
-      
-      if (attempt === retries) {
-        throw new Error(`Failed to fetch data after ${retries} attempts: ${error.message}`);
-      }
-      
-      // Add exponential backoff delay
-      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      if (attempt === retries) throw new Error(`Fetch failed: ${error.message}`);
+      await new Promise(r => setTimeout(r, 1000 * attempt));
     }
   }
 }
 
-async function getNearbyPhotoWikimedia(place: Place, location?: any): Promise<Photo | null> {
-  const { lat, lon } = place;
-  const radii = [500, 1000, 2000, 5000, 10000, 25000, 50000, 100000, 250000, 500000, 1000000]; // Much larger radii up to 1000km
-  
-  for (const radius of radii) {
-    // First try Wiki at this radius
-    const params = new URLSearchParams({
-      action: 'query',
-      generator: 'geosearch',
-      ggscoord: `${lat}|${lon}`,
-      ggsradius: radius.toString(),
-      ggsnamespace: '6', // File namespace to search for images directly
-      ggslimit: '5', // Get more results to filter through
-      prop: 'imageinfo|coordinates',
-      iiprop: 'url|extmetadata|size|timestamp', // Get comprehensive image info
-      format: 'json',
-      origin: '*' // For CORS if used in browser
-    });
-    const url = `${WIKIMEDIA_BASE_URL}?${params.toString()}`;
-    
-    try {
-      console.log(`Wikimedia: Searching with ${radius}m radius`);
-      const data = await fetchWithUA(url);
-      
-      // Check for warnings or errors
-      if (data.warnings) {
-        console.warn('Wikimedia warnings:', data.warnings);
-      }
-      
-      const pages = data.query?.pages;
-      if (pages && Object.keys(pages).length > 0) {
-        // Handle the -1 index case (sometimes used for first result)
-        const pageKeys = Object.keys(pages).filter(key => key !== '-1');
-        if (pageKeys.length === 0 && pages['-1']) {
-          pageKeys.push('-1');
-        }
-        
-        // Try to find the best photo - prioritize with coordinates, but accept any image
-        for (const pageId of pageKeys) {
-          const page = pages[pageId];
-          const coords = page.coordinates?.[0];
-          const imageInfo = page.imageinfo?.[0];
-          
-          // First priority: photos with coordinates and image info
-          if (coords && imageInfo && imageInfo.url) {
-            console.log(`Wikimedia: Found photo with coordinates at ${radius}m radius. Title: ${page.title}`);
-            return createPhotoObject(pageId, page, coords, imageInfo);
-          }
-          
-          // Second priority: photos with image info but no coordinates (still from the area)
-          if (imageInfo && imageInfo.url) {
-            console.log(`Wikimedia: Found photo without coordinates at ${radius}m radius. Title: ${page.title}`);
-            // Create coordinates from the search center for display purposes
-            const fallbackCoords = { lat: lat.toString(), lon: lon.toString(), primary: false, globe: 'earth' };
-            return createPhotoObject(pageId, page, fallbackCoords, imageInfo);
-          }
-        }
-      }
-      
-      console.log(`Wikimedia: No suitable photo found at ${radius}m. Trying Openverse before expanding radius...`);
-      
-      // Try Openverse before expanding radius
-      const openversePhoto = await getNearbyPhotoOpenverse(lat, lon, radius, location);
-      if (openversePhoto) {
-        console.log(`✅ Openverse SUCCESS at ${radius}m radius!`);
-        console.log(`📸 Image found: "${openversePhoto.title}"`);
-        console.log(`🎯 Image URL: ${openversePhoto.fileurl}`);
-        console.log(`👤 Author: ${openversePhoto.author || 'Unknown'}`);
-        console.log(`📄 License: ${openversePhoto.license || 'Unknown'}`);
-        return openversePhoto;
-      }
-      
-      console.log(`Openverse: No suitable photo found at ${radius}m. Trying larger radius...`);
-    } catch (error) {
-      console.error(`Wikimedia error at ${radius}m:`, error);
-      
-      // Try Openverse even if Wiki had an error
-      console.log(`Trying Openverse after Wiki error at ${radius}m...`);
-      const openversePhoto = await getNearbyPhotoOpenverse(lat, lon, radius, location);
-      if (openversePhoto) {
-        console.log(`✅ Openverse SUCCESS at ${radius}m radius (after Wiki error)!`);
-        console.log(`📸 Image found: "${openversePhoto.title}"`);
-        console.log(`🎯 Image URL: ${openversePhoto.fileurl}`);
-        console.log(`👤 Author: ${openversePhoto.author || 'Unknown'}`);
-        console.log(`📄 License: ${openversePhoto.license || 'Unknown'}`);
-        return openversePhoto;
-      }
-    }
-    
-    // Add a small delay between radius attempts to respect rate limits
-    if (radius !== radii[radii.length - 1]) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let tid: NodeJS.Timeout;
+  const to = new Promise<never>((_, reject) => { tid = setTimeout(() => reject(new Error(`Timeout ${ms}ms`)), ms); });
+  try { return await Promise.race([promise, to]); } finally { clearTimeout(tid!); }
+}
+
+function createLocationKeywords(location?: any): string[] {
+  if (!location) return [];
+  const k: string[] = [];
+  const add = (s?: string) => { if (s && s.length > 2) k.push(s); };
+  if (location.displayName?.length < 150) k.push(location.displayName);
+  if (location.city && location.country) add(`${location.city}, ${location.country}`);
+  if (location.city) add(location.city);
+  if (location.state && location.country) add(`${location.state}, ${location.country}`);
+  if (location.localName && location.localName.length > 2) add(location.localName);
+  if (location.country) add(location.country);
+  return k;
+}
+
+function getWikimediaFileUrl(page: any): string | null {
+  const info = page.imageinfo?.[0];
+  if (info?.url) return info.url;
+  if (page.thumbnail?.source) {
+    const m = page.thumbnail.source.match(/\/\d+px-(.+?)(?:\?|$)/);
+    if (m) { const f = m[1].charAt(0), s = m[1].charAt(1); return `https://upload.wikimedia.org/wikipedia/commons/${f}/${s}/${m[1]}`; }
+    return page.thumbnail.source;
   }
-  
-  console.log('Wikimedia: No photos found within maximum search radius. Trying fallback strategies...');
-  
-  // Fallback 1: Search for photos in nearby cities/landmarks
-  const fallbackPhoto = await searchNearbyCities(lat, lon);
-  if (fallbackPhoto) {
-    console.log('Wikimedia: Found fallback photo from nearby city/landmark');
-    return fallbackPhoto;
-  }
-  
-  // Fallback 2: Search for country-level photos
-  const countryPhoto = await searchCountryPhotos(lat, lon);
-  if (countryPhoto) {
-    console.log('Wikimedia: Found fallback photo from country level');
-    return countryPhoto;
-  }
-  
-  // Fallback 3: Global search as last resort
-  const globalPhoto = await searchGlobalPhotos(lat, lon);
-  if (globalPhoto) {
-    console.log('Wikimedia: Found fallback photo from global search');
-    return globalPhoto;
-  }
-  
-  console.log('Wikimedia: No photos found with any strategy.');
   return null;
 }
 
-// Fallback function to search for photos in nearby cities/landmarks
-async function searchNearbyCities(lat: number, lon: number): Promise<Photo | null> {
-  try {
-    // Search for photos in a much larger radius focusing on cities and landmarks
-    const params = new URLSearchParams({
-      action: 'query',
-      generator: 'geosearch',
-      ggscoord: `${lat}|${lon}`,
-      ggsradius: '500000', // 500km radius for cities/landmarks
-      ggsnamespace: '6',
-      ggslimit: '50', // Get more results
-      prop: 'imageinfo|coordinates',
-      iiprop: 'url|extmetadata|size|timestamp',
-      format: 'json',
-      origin: '*'
-    });
-    
-    const url = `${WIKIMEDIA_BASE_URL}?${params.toString()}`;
-    console.log('Wikimedia: Searching nearby cities/landmarks');
-    
-    const data = await fetchWithUA(url);
-    const pages = data.query?.pages;
-    
-    if (pages && Object.keys(pages).length > 0) {
-      // Look for photos with higher importance (cities, landmarks)
-      const pageKeys = Object.keys(pages).filter(key => key !== '-1');
-      
-      for (const pageId of pageKeys) {
-        const page = pages[pageId];
-        const coords = page.coordinates?.[0];
-        const imageInfo = page.imageinfo?.[0];
-        
-        // Accept any image with coordinates first
-        if (coords && imageInfo && imageInfo.url) {
-          console.log(`Wikimedia: Found city/landmark photo with coordinates: ${page.title}`);
-          return createPhotoObject(pageId, page, coords, imageInfo);
-        }
-        
-        // Accept any image without coordinates too
-        if (imageInfo && imageInfo.url) {
-          console.log(`Wikimedia: Found city/landmark photo without coordinates: ${page.title}`);
-          const fallbackCoords = { lat: lat.toString(), lon: lon.toString(), primary: false, globe: 'earth' };
-          return createPhotoObject(pageId, page, fallbackCoords, imageInfo);
-        }
+// ============================================================
+// STAGE 1: PLAYWRIGHT — Browser-based multi-engine image search
+// ============================================================
+
+const SEARCH_ENGINES = [
+  {
+    name: 'google',
+    buildUrl: (q: string) => `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(q)}`,
+    extractScript: `(() => {
+      const urls = [];
+      document.querySelectorAll('div[data-ou]').forEach(el => { const ou = el.getAttribute('data-ou'); if(ou) urls.push(ou); });
+      if(!urls.length) {
+        document.querySelectorAll('a[href*="/imgres?"]').forEach(a => {
+          try { const u = new URL(a.href); const imgurl = u.searchParams.get('imgurl'); if(imgurl) urls.push(decodeURIComponent(imgurl)); } catch(e){}
+        });
       }
-    }
-  } catch (error) {
-    console.warn('Wikimedia: Error in nearby cities search:', error);
-  }
-  
-  return null;
-}
+      return [...new Set(urls)].slice(0,20);
+    })()`,
+  },
+  {
+    name: 'bing',
+    buildUrl: (q: string) => `https://www.bing.com/images/search?q=${encodeURIComponent(q)}`,
+    extractScript: `(() => {
+      const urls = [];
+      document.querySelectorAll('a.iusc').forEach(a => {
+        try { const m = JSON.parse(a.getAttribute('m')); if(m.murl) urls.push(m.murl); } catch(e){}
+      });
+      return [...new Set(urls)].slice(0,20);
+    })()`,
+  },
+  {
+    name: 'duckduckgo',
+    buildUrl: (q: string) => `https://duckduckgo.com/?q=${encodeURIComponent(q)}&iax=images&ia=images`,
+    extractScript: `(() => {
+      const urls = [];
+      document.querySelectorAll('img.tile--img__media, img.js-images-tile, img[data-src]').forEach(img => {
+        const src = img.getAttribute('data-src') || img.src;
+        if(src && !src.startsWith('data:')) urls.push(src);
+      });
+      return [...new Set(urls)].slice(0,20);
+    })()`,
+  },
+];
 
-// Fallback function to search for country-level photos
-async function searchCountryPhotos(lat: number, lon: number): Promise<Photo | null> {
+async function findChromiumPath(): Promise<string | null> {
+  // 1) @sparticuz/chromium-min (Vercel/production — executablePath is async)
   try {
-    // Search for photos with country-level importance - much larger radius
-    const params = new URLSearchParams({
-      action: 'query',
-      generator: 'geosearch',
-      ggscoord: `${lat}|${lon}`,
-      ggsradius: '2000000', // 2000km radius for country-level
-      ggsnamespace: '6',
-      ggslimit: '30', // Get many more results
-      prop: 'imageinfo|coordinates',
-      iiprop: 'url|extmetadata|size|timestamp',
-      format: 'json',
-      origin: '*'
-    });
-    
-    const url = `${WIKIMEDIA_BASE_URL}?${params.toString()}`;
-    console.log('Wikimedia: Searching country-level photos');
-    
-    const data = await fetchWithUA(url);
-    const pages = data.query?.pages;
-    
-    if (pages && Object.keys(pages).length > 0) {
-      const pageKeys = Object.keys(pages).filter(key => key !== '-1');
-      
-      for (const pageId of pageKeys) {
-        const page = pages[pageId];
-        const coords = page.coordinates?.[0];
-        const imageInfo = page.imageinfo?.[0];
-        
-        // Accept any image with coordinates first
-        if (coords && imageInfo && imageInfo.url) {
-          console.log(`Wikimedia: Found country-level photo with coordinates: ${page.title}`);
-          return createPhotoObject(pageId, page, coords, imageInfo);
-        }
-        
-        // Accept any image without coordinates too - we need something from the region
-        if (imageInfo && imageInfo.url) {
-          console.log(`Wikimedia: Found country-level photo without coordinates: ${page.title}`);
-          const fallbackCoords = { lat: lat.toString(), lon: lon.toString(), primary: false, globe: 'earth' };
-          return createPhotoObject(pageId, page, fallbackCoords, imageInfo);
-        }
-      }
-    }
-  } catch (error) {
-    console.warn('Wikimedia: Error in country photos search:', error);
-  }
-  
-  return null;
-}
+    const cm = await import('@sparticuz/chromium-min');
+    const p = typeof cm.executablePath === 'function' ? await cm.executablePath() : cm.executablePath;
+    if (p && typeof p === 'string') return p;
+  } catch {}
 
-// Fallback function for global search as last resort
-async function searchGlobalPhotos(lat: number, lon: number): Promise<Photo | null> {
+  // 2) Playwright-installed chromium in ms-playwright cache
   try {
-    // Search globally with maximum radius
-    const params = new URLSearchParams({
-      action: 'query',
-      generator: 'geosearch',
-      ggscoord: `${lat}|${lon}`,
-      ggsradius: '10000000', // 10,000km radius - essentially global
-      ggsnamespace: '6',
-      ggslimit: '50', // Get many results
-      prop: 'imageinfo|coordinates',
-      iiprop: 'url|extmetadata|size|timestamp',
-      format: 'json',
-      origin: '*'
-    });
-    
-    const url = `${WIKIMEDIA_BASE_URL}?${params.toString()}`;
-    console.log('Wikimedia: Searching global photos as last resort');
-    
-    const data = await fetchWithUA(url);
-    const pages = data.query?.pages;
-    
-    if (pages && Object.keys(pages).length > 0) {
-      const pageKeys = Object.keys(pages).filter(key => key !== '-1');
-      
-      for (const pageId of pageKeys) {
-        const page = pages[pageId];
-        const coords = page.coordinates?.[0];
-        const imageInfo = page.imageinfo?.[0];
-        
-        // Accept any image - we're desperate at this point
-        if (imageInfo && imageInfo.url) {
-          console.log(`Wikimedia: Found global photo: ${page.title}`);
-          const fallbackCoords = coords || { lat: lat.toString(), lon: lon.toString(), primary: false, globe: 'earth' };
-          return createPhotoObject(pageId, page, fallbackCoords, imageInfo);
-        }
-      }
-    }
-  } catch (error) {
-    console.warn('Wikimedia: Error in global photos search:', error);
-  }
-  
-  return null;
-}
-
-// Helper function to create photo object
-function createPhotoObject(pageId: string | number, page: any, coords: any, imageInfo: any): Photo {
-  const extmetadata = imageInfo.extmetadata || {};
-  
-  return {
-    id: typeof pageId === 'string' ? parseInt(pageId) : pageId,
-    lat: parseFloat(coords.lat),
-    lng: parseFloat(coords.lon),
-    fileurl: imageInfo.url,
-    title: page.title,
-    description: extmetadata.ImageDescription?.value || extmetadata.ObjectName?.value,
-    author: extmetadata.Artist?.value || extmetadata.Credit?.value,
-    license: extmetadata.LicenseShortName?.value || extmetadata.License?.value,
-    width: imageInfo.width,
-    height: imageInfo.height,
-    size: imageInfo.size,
-    timestamp: imageInfo.timestamp,
-    pageId: typeof pageId === 'string' ? parseInt(pageId) : pageId,
-    namespace: page.ns,
-    coordinates: {
-      lat: parseFloat(coords.lat),
-      lon: parseFloat(coords.lon),
-      primary: coords.primary,
-      globe: coords.globe
-    }
-  };
-}
-
-// Export the main function for use in other modules
-// Helper function to create multiple search strategies for Openverse following best practices
-function createSearchStrategies(location: any): Array<{query: string, useExactMatch: boolean}> {
-  const strategies: Array<{query: string, useExactMatch: boolean}> = [];
-  
-  console.log(`🔧 Creating search strategies for location:`, location);
-  
-  // Strategy 1: Full display name (exact match for specific locations)
-  if (location.displayName && location.displayName.length < 100) { // Avoid overly long queries
-    strategies.push({query: location.displayName, useExactMatch: true});
-    console.log(`📝 Strategy 1: Full display name (exact) - "${location.displayName}"`);
-  }
-  
-  // Strategy 2: City + Country (exact match for specific combinations)
-  if (location.city && location.country) {
-    const cityCountry = `${location.city} ${location.country}`;
-    strategies.push({query: cityCountry, useExactMatch: true});
-    console.log(`🏙️ Strategy 2: City + Country (exact) - "${cityCountry}"`);
-  }
-  
-  // Strategy 3: State + Country (exact match)
-  if (location.state && location.country) {
-    const stateCountry = `${location.state} ${location.country}`;
-    strategies.push({query: stateCountry, useExactMatch: true});
-    console.log(`🗺️ Strategy 3: State + Country (exact) - "${stateCountry}"`);
-  }
-  
-  // Strategy 4: Local Name + Country (exact match)
-  if (location.localName && location.country) {
-    const localCountry = `${location.localName} ${location.country}`;
-    strategies.push({query: localCountry, useExactMatch: true});
-    console.log(`📍 Strategy 4: Local Name + Country (exact) - "${localCountry}"`);
-  }
-  
-  // Strategy 5: Just Country + landscape (stemmed search for broader results)
-  if (location.country) {
-    strategies.push({query: `${location.country} landscape`, useExactMatch: false});
-    console.log(`🌍 Strategy 5: Country + landscape (stemmed) - "${location.country} landscape"`);
-  }
-  
-  // Strategy 6: Country + city (stemmed search)
-  if (location.country && location.city) {
-    strategies.push({query: `${location.country} ${location.city}`, useExactMatch: false});
-    console.log(`🏙️ Strategy 6: Country + City (stemmed) - "${location.country} ${location.city}"`);
-  }
-  
-  // Strategy 7: Country + architecture (stemmed search)
-  if (location.country) {
-    strategies.push({query: `${location.country} architecture`, useExactMatch: false});
-    console.log(`🏛️ Strategy 7: Country + architecture (stemmed) - "${location.country} architecture"`);
-  }
-  
-  // Strategy 8: Country + nature (stemmed search)
-  if (location.country) {
-    strategies.push({query: `${location.country} nature`, useExactMatch: false});
-    console.log(`🌿 Strategy 8: Country + nature (stemmed) - "${location.country} nature"`);
-  }
-  
-  // Strategy 9: Country + travel (stemmed search)
-  if (location.country) {
-    strategies.push({query: `${location.country} travel`, useExactMatch: false});
-    console.log(`✈️ Strategy 9: Country + travel (stemmed) - "${location.country} travel"`);
-  }
-  
-  // Strategy 10: Country + tourism (stemmed search)
-  if (location.country) {
-    strategies.push({query: `${location.country} tourism`, useExactMatch: false});
-    console.log(`🎯 Strategy 10: Country + tourism (stemmed) - "${location.country} tourism"`);
-  }
-  
-  // Strategy 11: Regional terms based on country (stemmed search)
-  if (location.country) {
-    const countryLower = location.country.toLowerCase();
-    
-    if (countryLower.includes('europe') || countryLower.includes('france') || countryLower.includes('germany') || countryLower.includes('italy') || countryLower.includes('spain')) {
-      strategies.push({query: 'european architecture', useExactMatch: false});
-      strategies.push({query: 'european landscape', useExactMatch: false});
-      console.log(`🏰 Added European strategies (stemmed)`);
-    }
-    
-    if (countryLower.includes('asia') || countryLower.includes('china') || countryLower.includes('japan') || countryLower.includes('india') || countryLower.includes('thailand')) {
-      strategies.push({query: 'asian architecture', useExactMatch: false});
-      strategies.push({query: 'asian landscape', useExactMatch: false});
-      console.log(`🏮 Added Asian strategies (stemmed)`);
-    }
-    
-    if (countryLower.includes('america') || countryLower.includes('usa') || countryLower.includes('canada') || countryLower.includes('mexico')) {
-      strategies.push({query: 'american landscape', useExactMatch: false});
-      strategies.push({query: 'north american', useExactMatch: false});
-      console.log(`🗽 Added American strategies (stemmed)`);
-    }
-    
-    if (countryLower.includes('africa') || countryLower.includes('south africa') || countryLower.includes('egypt') || countryLower.includes('kenya')) {
-      strategies.push({query: 'african landscape', useExactMatch: false});
-      strategies.push({query: 'african wildlife', useExactMatch: false});
-      console.log(`🦁 Added African strategies (stemmed)`);
-    }
-    
-    if (countryLower.includes('australia') || countryLower.includes('new zealand')) {
-      strategies.push({query: 'australian landscape', useExactMatch: false});
-      strategies.push({query: 'oceania', useExactMatch: false});
-      console.log(`🦘 Added Australian strategies (stemmed)`);
-    }
-  }
-  
-  // Strategy 12: Generic landscape terms (stemmed search for broad results)
-  strategies.push({query: 'landscape photography', useExactMatch: false});
-  strategies.push({query: 'nature photography', useExactMatch: false});
-  strategies.push({query: 'travel photography', useExactMatch: false});
-  console.log(`📸 Added generic photography strategies (stemmed)`);
-  
-  console.log(`📋 Total strategies created: ${strategies.length}`);
-  return strategies;
-}
-
-// Helper function to try a single search strategy following Openverse best practices
-async function trySearchStrategy(searchQuery: string, lat: number, lon: number, useExactMatch: boolean = false): Promise<Photo | null> {
-  try {
-    // Format query according to Openverse guidelines
-    const formattedQuery = useExactMatch ? `"${searchQuery}"` : searchQuery;
-    console.log(`🔍 Openverse: Trying search strategy - "${formattedQuery}" (${useExactMatch ? 'exact match' : 'stemmed search'})`);
-    
-    // Build search URL following Openverse documentation guidelines
-    const params = new URLSearchParams({
-      q: formattedQuery,
-      page_size: '20', // Get more results for better selection
-      page: '1',
-      license: 'cc0,by,by-sa,by-nc,by-nc-sa,by-nd,by-nc-nd', // Include all common licenses
-      source: 'flickr,wikimedia', // Focus on reliable sources
-      mature: 'false' // Exclude mature content
-    });
-    
-    const searchUrl = `${OPENVERSE_BASE_URL}/?${params.toString()}`;
-    console.log(`🌐 Openverse URL: ${searchUrl}`);
-    
-    const response = await fetchWithUA(searchUrl);
-    
-    if (!response || !response.results || response.results.length === 0) {
-      console.log(`❌ Openverse: No results for "${formattedQuery}"`);
-      return null;
-    }
-    
-    console.log(`📊 Openverse: Found ${response.results.length} results for "${formattedQuery}"`);
-    
-    // Filter out mature content and prioritize high-quality images
-    const validImages = response.results
-      .filter((img: OpenverseImage) => !img.mature && img.width && img.height) // Ensure we have dimensions
-      .filter((img: OpenverseImage) => img.width >= 400 && img.height >= 300) // Minimum quality threshold
-      .slice(0, 15); // Take top 15 for better selection
-    
-    console.log(`✅ Openverse: ${validImages.length} suitable images after filtering`);
-    
-    if (validImages.length === 0) {
-      console.log(`❌ Openverse: No suitable images found (all filtered out)`);
-      return null;
-    }
-    
-    // Prioritize images with better titles (title matches get higher weight per docs)
-    const sortedImages = validImages.sort((a: OpenverseImage, b: OpenverseImage) => {
-      const aTitleMatch = a.title.toLowerCase().includes(searchQuery.toLowerCase()) ? 1 : 0;
-      const bTitleMatch = b.title.toLowerCase().includes(searchQuery.toLowerCase()) ? 1 : 0;
-      return bTitleMatch - aTitleMatch; // Higher title match first
-    });
-    
-    // Randomly select from top 5 results for variety
-    const topResults = sortedImages.slice(0, 5);
-    const randomIndex = Math.floor(Math.random() * topResults.length);
-    const selectedImage = topResults[randomIndex];
-    
-    console.log(`🎲 Openverse: Selected from top ${topResults.length} results (index ${randomIndex + 1})`);
-    console.log(`📸 Openverse: Selected image: "${selectedImage.title}"`);
-    console.log(`🎯 Openverse: Image URL: ${selectedImage.url}`);
-    console.log(`👤 Openverse: Creator: ${selectedImage.creator}`);
-    console.log(`📄 Openverse: License: ${selectedImage.license}`);
-    console.log(`📏 Openverse: Dimensions: ${selectedImage.width}x${selectedImage.height}`);
-    console.log(`🏷️ Openverse: Tags: [${selectedImage.tags.map((tag: any) => tag.name).slice(0, 5).join(', ')}]`);
-    
-    // Convert Openverse image to Photo format
-    const photo: Photo = {
-      id: parseInt(selectedImage.id.replace(/-/g, '').substring(0, 8), 16), // Convert UUID to number
-      lat: lat, // Use the target coordinates for display purposes
-      lng: lon, // Use the target coordinates for display purposes
-      fileurl: selectedImage.url,
-      title: selectedImage.title,
-      description: selectedImage.tags.map((tag: any) => tag.name).join(', '),
-      author: selectedImage.creator,
-      license: selectedImage.license.toUpperCase(),
-      width: selectedImage.width,
-      height: selectedImage.height,
-      size: selectedImage.filesize,
-      timestamp: selectedImage.indexed_on,
-      pageId: parseInt(selectedImage.id.replace(/-/g, '').substring(0, 8), 16),
-      namespace: 0,
-      coordinates: {
-        lat: lat, // Use target coordinates since Openverse doesn't provide geolocation
-        lon: lon, // Use target coordinates since Openverse doesn't provide geolocation
-        primary: true,
-        globe: 'earth'
-      }
-    };
-    
-    console.log(`✅ Openverse: Successfully converted to Photo object`);
-    return photo;
-    
-  } catch (error) {
-    console.error(`💥 Openverse: Error with strategy "${searchQuery}":`, error);
-    return null;
-  }
-}
-
-// Openverse API function - multi-strategy search with intelligent fallbacks following best practices
-async function getNearbyPhotoOpenverse(lat: number, lon: number, radius: number = 5000, location?: any): Promise<Photo | null> {
-  try {
-    console.log(`🔍 Openverse: Starting multi-strategy search for coordinates ${lat}, ${lon}`);
-    
-    // Create multiple search strategies with exact match preferences
-    const strategies = location ? createSearchStrategies(location) : [
-      {query: 'landscape photography', useExactMatch: false},
-      {query: 'nature photography', useExactMatch: false},
-      {query: 'travel photography', useExactMatch: false}
+    const os = require('os') as typeof import('os');
+    const path = require('path') as typeof import('path');
+    const fs = require('fs') as typeof import('fs');
+    const home = os.homedir();
+    const candidates = [
+      path.join(home, 'AppData', 'Local', 'ms-playwright'),
+      path.join(home, '.cache', 'ms-playwright'),
+      '/tmp/ms-playwright',
     ];
-    
-    console.log(`📋 Openverse: Will try ${strategies.length} different search strategies`);
-    
-    // Try each strategy until one succeeds
-    for (let i = 0; i < strategies.length; i++) {
-      const strategy = strategies[i];
-      console.log(`🎯 Openverse: Strategy ${i + 1}/${strategies.length}: "${strategy.query}" (${strategy.useExactMatch ? 'exact match' : 'stemmed search'})`);
-      
-      const photo = await trySearchStrategy(strategy.query, lat, lon, strategy.useExactMatch);
-      if (photo) {
-        console.log(`✅ Openverse: SUCCESS with strategy ${i + 1}: "${strategy.query}"`);
-        console.log(`📸 Image found: "${photo.title}"`);
-        console.log(`🎯 Image URL: ${photo.fileurl}`);
-        console.log(`👤 Author: ${photo.author || 'Unknown'}`);
-        console.log(`📄 License: ${photo.license || 'Unknown'}`);
-        return photo;
-      }
-      
-      console.log(`❌ Openverse: Strategy ${i + 1} failed: "${strategy.query}"`);
-      
-      // Add a small delay between strategies to be respectful to the API
-      if (i < strategies.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 500));
+    for (const base of candidates) {
+      if (!fs.existsSync(base)) continue;
+      const entries = fs.readdirSync(base).filter((e: string) => e.startsWith('chromium-'));
+      entries.sort().reverse();
+      for (const dir of entries) {
+        const dirPath = path.join(base, dir);
+        const leafDirs = fs.readdirSync(dirPath).filter((e: string) => {
+          const s = fs.statSync(path.join(dirPath, e));
+          return s.isDirectory();
+        });
+        for (const leaf of leafDirs) {
+          for (const name of ['chrome', 'chromium', 'chrome-headless-shell']) {
+            for (const ext of ['exe', '']) {
+              const full = path.join(dirPath, leaf, ext ? `${name}.${ext}` : name);
+              if (fs.existsSync(full)) return full;
+            }
+          }
+        }
       }
     }
-    
-    console.log(`❌ Openverse: All ${strategies.length} strategies failed`);
-    return null;
-    
-  } catch (error) {
-    console.error(`💥 Openverse: Error in multi-strategy search:`, error);
-    return null;
-  }
-}
+  } catch {}
 
-// Main function with infinite fallback logic: Wiki -> Openverse -> Wiki -> Openverse (until success)
-async function getNearbyPhotoWithFallback(lat: number, lon: number, radius: number = 5000, location?: any): Promise<Photo | null> {
-  let attempt = 0;
-  let consecutiveFailures = 0;
-  const maxConsecutiveFailures = 50; // Safety valve to prevent infinite loops in extreme cases
-  
-  console.log(`🔄 Starting infinite fallback search for images near ${lat}, ${lon}`);
-  if (location) {
-    console.log(`📍 Location details: ${location.city || 'Unknown City'}, ${location.state || 'Unknown State'}, ${location.country || 'Unknown Country'}`);
-  }
-  console.log(`🎯 Fallback Strategy: Wiki (with Openverse at each radius) → Openverse → Wiki (with Openverse at each radius) → Openverse → ... (until success)`);
-  
-  while (consecutiveFailures < maxConsecutiveFailures) {
-    try {
-      let photo: Photo | null = null;
-      
-      if (attempt % 2 === 0) {
-        // Even attempts: Try Wikimedia first
-        console.log(`🔄 Attempt ${attempt + 1}: Trying Wikimedia Commons...`);
-        console.log(`📊 Current attempt pattern: Wiki (attempt ${attempt + 1})`);
-        photo = await getNearbyPhotoWikimedia({ lat, lon }, location);
-        
-        if (photo) {
-          console.log(`✅ Wikimedia SUCCESS on attempt ${attempt + 1}!`);
-          console.log(`📸 Image found: "${photo.title}"`);
-          console.log(`🎯 Image URL: ${photo.fileurl}`);
-          console.log(`👤 Author: ${photo.author || 'Unknown'}`);
-          console.log(`📄 License: ${photo.license || 'Unknown'}`);
-          console.log(`🏁 Fallback completed successfully with Wikimedia!`);
-          return photo;
-        }
-        
-        console.log(`❌ Wikimedia failed on attempt ${attempt + 1} - will try Openverse next`);
-      } else {
-        // Odd attempts: Try Openverse
-        console.log(`🔄 Attempt ${attempt + 1}: Trying Openverse API...`);
-        console.log(`📊 Current attempt pattern: Openverse (attempt ${attempt + 1})`);
-        photo = await getNearbyPhotoOpenverse(lat, lon, radius, location);
-        
-        if (photo) {
-          console.log(`✅ Openverse SUCCESS on attempt ${attempt + 1}!`);
-          console.log(`📸 Image found: "${photo.title}"`);
-          console.log(`🎯 Image URL: ${photo.fileurl}`);
-          console.log(`👤 Author: ${photo.author || 'Unknown'}`);
-          console.log(`📄 License: ${photo.license || 'Unknown'}`);
-          console.log(`🏁 Fallback completed successfully with Openverse!`);
-          return photo;
-        }
-        
-        console.log(`❌ Openverse failed on attempt ${attempt + 1} - will try Wikimedia next`);
-      }
-      
-      attempt++;
-      consecutiveFailures++;
-      
-      // Progressive delay to respect rate limits - increases with each failure
-      const baseDelay = 2000; // 2 seconds base delay
-      const progressiveDelay = Math.min(consecutiveFailures * 1000, 10000); // Max 10 seconds
-      const totalDelay = baseDelay + progressiveDelay;
-      
-      console.log(`⏳ Waiting ${totalDelay}ms before next attempt... (consecutive failures: ${consecutiveFailures})`);
-      await new Promise(resolve => setTimeout(resolve, totalDelay));
-      
-    } catch (error) {
-      console.error(`💥 Attempt ${attempt + 1} failed with error:`, error);
-      attempt++;
-      consecutiveFailures++;
-      
-      // Longer delay on errors to be extra respectful to APIs
-      const errorDelay = 5000 + (consecutiveFailures * 2000);
-      console.log(`⏳ Error occurred, waiting ${errorDelay}ms before retry...`);
-      await new Promise(resolve => setTimeout(resolve, errorDelay));
+  // 3) System-installed Chrome / Chromium
+  try {
+    const fs = require('fs') as typeof import('fs');
+    const checks = [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      '/usr/bin/google-chrome',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/chromium',
+    ];
+    for (const p of checks) {
+      if (fs.existsSync(p)) return p;
     }
-  }
-  
-  console.log(`❌ Stopped after ${maxConsecutiveFailures} consecutive failures - this location may not have any images available`);
-  console.log(`📊 Final Summary: ${attempt} total attempts made (${Math.ceil(attempt/2)} Wiki attempts, ${Math.floor(attempt/2)} Openverse attempts)`);
+  } catch {}
+
   return null;
 }
 
-export { getNearbyPhotoWikimedia, getNearbyPhotoOpenverse, getNearbyPhotoWithFallback };
+async function stagePlaywrightMultiEngine(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  const keywords = createLocationKeywords(location);
+  if (keywords.length === 0) return null;
 
-// Example usage with provided location data
-async function main() {
-  const examplePlace: Place = {
-    lat: 33.54634,
-    lon: 133.6710487
-    // Other fields omitted for brevity
-  };
+  let playwright: any;
+  let chromiumArgs: string[];
+  try {
+    playwright = await import('playwright-core');
+    const cm = await import('@sparticuz/chromium-min').catch(() => null);
+    chromiumArgs = cm?.args ?? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--headless'];
 
-  const photo = await getNearbyPhotoWikimedia(examplePlace);
-  if (photo) {
-    console.log('Found nearby photo from Wikimedia Commons:');
-    console.log(`ID: ${photo.id}`);
-    console.log(`Title: ${photo.title}`);
-    console.log(`Location: ${photo.lat.toFixed(6)}, ${photo.lng.toFixed(6)}`);
-    console.log(`Image URL: ${photo.fileurl}`);
-    console.log(`Author: ${photo.author || 'Unknown'}`);
-    console.log(`License: ${photo.license || 'Unknown'}`);
-    console.log(`Size: ${photo.width}x${photo.height} (${photo.size} bytes)`);
-    // Optionally, open or download the image
-  } else {
-    console.log('No photo found from Wikimedia Commons.');
+    const execPath = await findChromiumPath();
+    if (!execPath) return null;
+
+    for (const keyword of keywords) {
+      for (const engine of SEARCH_ENGINES) {
+        let browser: any = null;
+        try {
+          browser = await playwright.chromium.launch({
+            args: chromiumArgs,
+            executablePath: execPath,
+            headless: true,
+          });
+          const context = await browser.newContext({ userAgent: randomUA() });
+          const page = await context.newPage();
+          await page.goto(engine.buildUrl(keyword), { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await page.waitForTimeout(2500 + Math.random() * 2000);
+
+          try { await page.evaluate(`(async()=>{for(let i=0;i<3;i++){window.scrollTo(0,document.body.scrollHeight);await new Promise(r=>setTimeout(r,1200));}window.scrollTo(0,0);})()`); } catch {}
+          await page.waitForTimeout(1500);
+
+          const urls: string[] = await page.evaluate(engine.extractScript).catch(() => []);
+          await browser.close().catch(() => {});
+
+          const resolved = urls.map(resolveUrl).filter((u: string) => !isJunkUrl(u) && u.startsWith('http'));
+          if (resolved.length === 0) continue;
+
+          const locationTerms = getLocationTerms(location);
+          const kwParts = keyword.toLowerCase().split(',').map((s: string) => s.trim());
+          const scored = resolved.map((url: string) => ({
+            url,
+            score: (kwParts.some((p: string) => url.toLowerCase().includes(p)) ? 2 : 0) +
+              (locationTerms.some((t: string) => url.toLowerCase().includes(t)) ? 2 : 0),
+          })).sort((a: any, b: any) => b.score - a.score);
+
+          return createPhotoFromUrl(scored[0].url, lat, lon, keyword, engine.name);
+        } catch {
+          if (browser) await browser.close().catch(() => {});
+          continue;
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 2: DuckDuckGo — Axios VQD fallback
+// ============================================================
+
+async function stageDuckDuckGoAxios(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  const keywords = createLocationKeywords(location);
+  if (keywords.length === 0) return null;
+
+  for (const keyword of keywords) {
+    try {
+      const htmlResp = await axios.get(`https://duckduckgo.com/?q=${encodeURIComponent(keyword)}&iax=images&ia=images`, {
+        headers: { 'User-Agent': randomUA(), Accept: 'text/html,*/*', 'Accept-Language': 'en-US,en;q=0.9' },
+        timeout: 8000, responseType: 'text',
+      });
+      const html = typeof htmlResp.data === 'string' ? htmlResp.data : String(htmlResp.data);
+      const vqd = html.match(/vqd=([\d-]+)/)?.[1] || html.match(/"vqd":"([\d-]+)"/)?.[1];
+      if (!vqd) continue;
+
+      const imageData = await withTimeout(fetchWithUA(`https://duckduckgo.com/i.js?q=${encodeURIComponent(keyword)}&o=json&vqd=${vqd}`, 2, 5000), 5000);
+      if (!imageData?.results) continue;
+
+      const locationTerms = getLocationTerms(location);
+      const scored = imageData.results
+        .filter((r: any) => r.image && !isJunkUrl(r.image) && !r.image.endsWith('.svg'))
+        .map((r: any) => ({
+          url: resolveUrl(r.image),
+          title: r.title || '',
+          score: countLocationTerms(r.title, locationTerms) * 3 +
+            (r.title?.toLowerCase().includes(keyword.toLowerCase()) ? 2 : 0) +
+            (r.url?.toLowerCase().includes(keyword.toLowerCase().split(',')[0]) ? 1 : 0),
+          skipGeneric: isGenericTitle(r.title),
+        }))
+        .filter((r: any) => !r.skipGeneric && !isJunkUrl(r.url))
+        .sort((a: any, b: any) => b.score - a.score);
+
+      if (scored.length === 0) continue;
+      for (const candidate of scored.slice(0, 5)) {
+        const ok = await verifyImageUrl(candidate.url).catch(() => false);
+        if (ok) return createPhotoFromUrl(candidate.url, lat, lon, candidate.title || keyword);
+      }
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 3: Google Custom Search API
+// ============================================================
+
+async function stageGoogleSearch(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  if (!GOOGLE_API_KEY || !GOOGLE_CX) return null;
+  const keywords = createLocationKeywords(location);
+  if (keywords.length === 0) return null;
+
+  for (const keyword of keywords) {
+    try {
+      const data = await withTimeout(fetchWithUA(`https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=${encodeURIComponent(keyword)}&searchType=image&safe=active&num=5`, 1, 5000), 5000);
+      if (!data?.items) continue;
+
+      const locationTerms = getLocationTerms(location);
+      const scored = data.items
+        .filter((i: any) => i.link && !isJunkUrl(i.link) && !i.link.endsWith('.svg'))
+        .map((i: any) => ({ url: i.link, score: countLocationTerms(i.title, locationTerms) * 3 + countLocationTerms(i.snippet, locationTerms) * 2 }))
+        .filter((r: any) => !isGenericTitle(r.url))
+        .sort((a: any, b: any) => b.score - a.score);
+      if (scored.length === 0) continue;
+      return createPhotoFromUrl(scored[0].url, lat, lon, keyword);
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 4: Bing API
+// ============================================================
+
+async function stageBingSearch(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  if (!BING_API_KEY) return null;
+  const keywords = createLocationKeywords(location);
+  if (keywords.length === 0) return null;
+
+  for (const keyword of keywords) {
+    try {
+      const data = await withTimeout(fetchWithUA(`https://api.bing.microsoft.com/v7.0/images/search?q=${encodeURIComponent(keyword)}&count=5&safeSearch=Strict`, 1, 5000), 5000);
+      if (!data?.value) continue;
+
+      const locationTerms = getLocationTerms(location);
+      const scored = data.value
+        .filter((i: any) => i.contentUrl && !isJunkUrl(i.contentUrl))
+        .map((i: any) => ({ url: i.contentUrl, score: countLocationTerms(i.name, locationTerms) * 3 }))
+        .filter((r: any) => !isGenericTitle(r.url))
+        .sort((a: any, b: any) => b.score - a.score);
+      if (scored.length === 0) continue;
+      return createPhotoFromUrl(scored[0].url, lat, lon, keyword);
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 5: Wikimedia Commons Geosearch
+// ============================================================
+
+async function stageWikimediaGeosearch(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  const locationTerms = getLocationTerms(location);
+
+  for (let radius = 100; radius <= 10000; radius *= 2) {
+    try {
+      const data = await withTimeout(fetchWithUA(
+        `${WIKIMEDIA_BASE_URL}?${new URLSearchParams({ action: 'query', generator: 'geosearch', ggscoord: `${lat}|${lon}`, ggsradius: String(Math.min(radius, 10000)), ggsnamespace: '6', ggslimit: '25', prop: 'imageinfo|coordinates', iiprop: 'url|extmetadata|size|timestamp', format: 'json', origin: '*' })}`,
+        2, 5000,
+      ), 6000);
+      const pages = data.query?.pages;
+      if (!pages) continue;
+
+      const candidates: Array<{ page: any; pageId: string; coords: any; info: any; score: number }> = [];
+
+      for (const pageId of Object.keys(pages).filter(k => k !== '-1')) {
+        const page = pages[pageId];
+        const coords = page.coordinates?.[0];
+        const info = page.imageinfo?.[0];
+        if (!info?.url || isJunkUrl(info.url)) continue;
+
+        const dist = coords ? haversineKm(lat, lon, parseFloat(coords.lat), parseFloat(coords.lon)) : Infinity;
+        const title = page.title || '';
+        const desc = (info.extmetadata?.ImageDescription?.value || '').toLowerCase();
+        let score = 0;
+
+        if (coords) { score += 10; if (dist < 1) score += 15; else if (dist < 5) score += 10; else if (dist < 20) score += 5; }
+        score += countLocationTerms(title, locationTerms) * 8;
+        score += countLocationTerms(desc, locationTerms) * 5;
+        if (isGenericTitle(title)) score -= 20;
+        if (desc.includes('photograph') || desc.includes('photo of')) score += 3;
+
+        candidates.push({ page, pageId, coords, info, score });
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      const best = candidates.find(c => c.score > -15);
+      if (best) {
+        const coords = best.coords || { lat: lat.toString(), lon: lon.toString(), primary: false, globe: 'earth' };
+        return createPhotoObject(best.pageId, best.page, coords, best.info);
+      }
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 6: Wikipedia Article (with coordinate check)
+// ============================================================
+
+async function stageWikipediaArticle(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  const keywords = createLocationKeywords(location);
+  if (keywords.length === 0) return null;
+  const locationTerms = getLocationTerms(location);
+
+  for (const keyword of keywords) {
+    try {
+      const data = await withTimeout(fetchWithUA(
+        `${WIKIPEDIA_BASE_URL}?${new URLSearchParams({ action: 'query', generator: 'search', gsrsearch: keyword, gsrlimit: '5', prop: 'pageimages|coordinates|info', pithumbsize: '800', format: 'json', origin: '*' })}`,
+        2, 5000,
+      ), 6000);
+      const pages = data.query?.pages;
+      if (!pages) continue;
+
+      const candidates: Array<{ page: any; score: number }> = [];
+      for (const page of Object.values(pages) as any[]) {
+        if (!page.thumbnail?.source && !page.pageimage) continue;
+        const coords = page.coordinates?.[0];
+        let score = 0;
+        if (coords) {
+          const dist = haversineKm(lat, lon, coords.lat, coords.lon);
+          if (dist < 5) score += 20; else if (dist < 20) score += 10; else if (dist < 50) score += 5; else score -= 10;
+        } else { score -= 5; }
+        score += countLocationTerms(page.title, locationTerms) * 10;
+        if (isGenericTitle(page.title)) score -= 15;
+        candidates.push({ page, score });
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      const best = candidates.find(c => c.score > 5);
+      if (!best) continue;
+
+      const thumb = best.page.thumbnail?.source || best.page.pageimage;
+      if (!thumb) continue;
+      const coords = best.page.coordinates?.[0];
+      const pc = coords ? { lat: coords.lat.toString(), lon: coords.lon.toString() } : { lat: lat.toString(), lon: lon.toString(), primary: false, globe: 'earth' };
+      return createPhotoObject(best.page.pageid || Math.random().toString(), best.page, pc, { url: thumb, width: best.page.thumbnail?.width || 800, height: best.page.thumbnail?.height || 600 });
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 7: Wikimedia Name Search
+// ============================================================
+
+async function stageWikimediaNameSearch(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  const keywords = createLocationKeywords(location);
+  if (keywords.length === 0) return null;
+  const terms = getLocationTerms(location);
+
+  for (const keyword of keywords) {
+    try {
+      const sd = await withTimeout(fetchWithUA(`${WIKIMEDIA_BASE_URL}?${new URLSearchParams({ action: 'query', list: 'search', srsearch: keyword, srnamespace: '6', srlimit: '15', format: 'json', origin: '*' })}`, 2, 5000), 6000);
+      const results = sd.query?.search;
+      if (!results) continue;
+
+      const ids = results.slice(0, 8).map((r: any) => r.pageid).filter(Boolean);
+      const id = await withTimeout(fetchWithUA(`${WIKIMEDIA_BASE_URL}?${new URLSearchParams({ action: 'query', pageids: ids.join('|'), prop: 'imageinfo|coordinates', iiprop: 'url|extmetadata|size', format: 'json', origin: '*' })}`, 1, 5000), 5000);
+      const pgs = id.query?.pages;
+      if (!pgs) continue;
+
+      const candidates: Array<{ pid: string; page: any; score: number }> = [];
+      for (const pid of Object.keys(pgs).filter(k => k !== '-1')) {
+        const page = pgs[pid]; const url = getWikimediaFileUrl(page); if (!url) continue;
+        let score = countLocationTerms(page.title, terms) * 5;
+        if (isGenericTitle(page.title)) score -= 15;
+        const coords = page.coordinates?.[0];
+        if (coords) { const d = haversineKm(lat, lon, coords.lat, coords.lon); score += d < 10 ? 15 : d < 50 ? 5 : 0; }
+        candidates.push({ pid, page, score });
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      const best = candidates.find(c => c.score > -10);
+      if (!best) continue;
+      const coords = best.page.coordinates?.[0];
+      const pc = coords ? { lat: coords.lat.toString(), lon: coords.lon.toString() } : { lat: lat.toString(), lon: lon.toString(), primary: false, globe: 'earth' };
+      return createPhotoObject(best.pid, best.page, pc, best.page.imageinfo?.[0] || {});
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 8: Openverse
+// ============================================================
+
+async function stageOpenverse(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  const queries = location ? [`"${location.displayName}"`, `${location.city || ''} ${location.country || ''}`, `${location.country || ''} landscape`] : ['landscape photography'];
+  const terms = getLocationTerms(location);
+
+  for (const q of queries) {
+    try {
+      const data = await withTimeout(fetchWithUA(`${OPENVERSE_BASE_URL}/?${new URLSearchParams({ q, page_size: '20', license: 'cc0,by,by-sa,by-nc,by-nc-sa,by-nd,by-nc-nd', source: 'flickr,wikimedia', mature: 'false' })}`, 1, 5000), 5000);
+      if (!data?.results) continue;
+
+      const scored = data.results
+        .filter((i: any) => !i.mature && i.url && !isJunkUrl(i.url))
+        .map((i: any) => ({ url: i.url, title: i.title, score: countLocationTerms(i.title, terms) * 5, skipGeneric: isGenericTitle(i.title) }))
+        .filter((r: any) => !r.skipGeneric)
+        .sort((a: any, b: any) => b.score - a.score);
+      if (scored.length === 0) continue;
+      return createPhotoFromUrl(scored[0].url, lat, lon, scored[0].title);
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 9: Country Fallback
+// ============================================================
+
+async function stageCountryFallback(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  const country = location?.country;
+  if (!country) return null;
+
+  for (const kw of [country, `${country} landscape`, `${country} city`, `${country} landmark`]) {
+    try {
+      const data = await withTimeout(fetchWithUA(
+        `${WIKIMEDIA_BASE_URL}?${new URLSearchParams({ action: 'query', generator: 'search', gsrsearch: kw, gsrnamespace: '6', gsrlimit: '20', prop: 'imageinfo|coordinates', iiprop: 'url|extmetadata|size', format: 'json', origin: '*' })}`,
+        1, 5000,
+      ), 6000);
+      const pages = data.query?.pages;
+      if (!pages) continue;
+
+      const candidates: Array<{ pid: string; page: any; score: number }> = [];
+      for (const pid of Object.keys(pages).filter(k => k !== '-1')) {
+        const page = pages[pid]; const info = page.imageinfo?.[0]; if (!info?.url) continue;
+        let score = 0;
+        const coords = page.coordinates?.[0];
+        if (coords) { const d = haversineKm(lat, lon, coords.lat, coords.lon); if (d < 100) score += 10; else if (d < 500) score += 5; }
+        candidates.push({ pid, page, score });
+      }
+      candidates.sort((a, b) => b.score - a.score);
+      if (candidates.length === 0) continue;
+
+      const best = candidates[0];
+      const coords = best.page.coordinates?.[0];
+      const pc = coords ? { lat: coords.lat.toString(), lon: coords.lon.toString() } : { lat: lat.toString(), lon: lon.toString(), primary: false, globe: 'earth' };
+      return createPhotoObject(best.pid, best.page, pc, best.page.imageinfo?.[0]);
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// STAGE 10: Pexels / Pixabay
+// ============================================================
+
+async function stagePexels(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  if (!PEXELS_API_KEY) return null;
+  const keywords = createLocationKeywords(location);
+  if (keywords.length === 0) return null;
+  const terms = getLocationTerms(location);
+
+  for (const kw of keywords) {
+    try {
+      const data = await withTimeout(fetchWithUA(`https://api.pexels.com/v1/search?query=${encodeURIComponent(kw)}&per_page=5`, 1, 5000), 5000);
+      const photos = data?.photos?.filter((p: any) => p.src?.large).map((p: any) => ({ url: p.src.large, score: countLocationTerms(p.alt || '', terms) * 3, skip: isGenericTitle(p.alt) })).filter((r: any) => !r.skip).sort((a: any, b: any) => b.score - a.score);
+      if (photos?.length) return createPhotoFromUrl(photos[0].url, lat, lon, kw);
+    } catch { continue; }
+  }
+  return null;
+}
+
+async function stagePixabay(lat: number, lon: number, location?: any): Promise<Photo | null> {
+  if (!PIXABAY_API_KEY) return null;
+  const keywords = createLocationKeywords(location);
+  if (keywords.length === 0) return null;
+  const terms = getLocationTerms(location);
+
+  for (const kw of keywords) {
+    try {
+      const data = await withTimeout(fetchWithUA(`https://pixabay.com/api/?key=${PIXABAY_API_KEY}&q=${encodeURIComponent(kw)}&image_type=photo&per_page=5&safesearch=true`, 1, 5000), 5000);
+      const hits = data?.hits?.filter((h: any) => h.webformatURL).map((h: any) => ({ url: h.webformatURL, score: countLocationTerms(h.tags || '', terms) * 5, skip: isGenericTitle(h.tags) })).filter((r: any) => !r.skip).sort((a: any, b: any) => b.score - a.score);
+      if (hits?.length) return createPhotoFromUrl(hits[0].url, lat, lon, kw);
+    } catch { continue; }
+  }
+  return null;
+}
+
+// ============================================================
+// MAIN PIPELINE — parallel race
+// ============================================================
+
+async function runStage(s: Stage): Promise<Photo | null> {
+  try {
+    const photo = await withTimeout(s.fn(), s.timeout);
+    if (photo && photo.fileurl && !photo.fileurl.includes('wikimedia.org')) {
+      const ok = await verifyImageUrl(photo.fileurl).catch(() => false);
+      if (!ok) return null;
+    }
+    return photo;
+  } catch {
+    return null;
   }
 }
 
-// Only run main if this file is executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch(console.error);
+async function raceStages(stages: Stage[]): Promise<Photo | null> {
+  if (stages.length === 0) return null;
+  // Kick off all stage promises at once, then return the first non-null
+  const wrapped = stages.map(s =>
+    runStage(s).then(r => ({ from: s.name, photo: r })).catch(() => ({ from: s.name, photo: null as Photo | null }))
+  );
+  const results = await Promise.all(wrapped);
+  return results.find(r => r.photo !== null)?.photo || null;
+}
+
+export async function getNearbyPhotoWithFallback(lat: number, lon: number, _radius = 5000, location?: any): Promise<Photo | null> {
+  const fastStages: Stage[] = [
+    { name: 'DuckDuckGo Axios', fn: () => stageDuckDuckGoAxios(lat, lon, location), timeout: 10000 },
+    { name: 'Openverse', fn: () => stageOpenverse(lat, lon, location), timeout: 8000 },
+    { name: 'Wikipedia Article', fn: () => stageWikipediaArticle(lat, lon, location), timeout: 8000 },
+    { name: 'Google Custom Search', fn: () => stageGoogleSearch(lat, lon, location), timeout: 8000, skip: !GOOGLE_API_KEY || !GOOGLE_CX },
+    { name: 'Bing Search', fn: () => stageBingSearch(lat, lon, location), timeout: 8000, skip: !BING_API_KEY },
+  ];
+
+  const slowStages: Stage[] = [
+    { name: 'Wikimedia Geosearch', fn: () => stageWikimediaGeosearch(lat, lon, location), timeout: 12000 },
+    { name: 'Wikimedia Name Search', fn: () => stageWikimediaNameSearch(lat, lon, location), timeout: 8000 },
+    { name: 'Country Fallback', fn: () => stageCountryFallback(lat, lon, location), timeout: 10000 },
+    { name: 'Pexels', fn: () => stagePexels(lat, lon, location), timeout: 8000, skip: !PEXELS_API_KEY },
+    { name: 'Pixabay', fn: () => stagePixabay(lat, lon, location), timeout: 8000, skip: !PIXABAY_API_KEY },
+  ];
+
+  // Wave 1: fast sources in parallel — should resolve in ~3-8s
+  const hit1 = await raceStages(fastStages.filter(s => !s.skip));
+  if (hit1) return hit1;
+
+  // Wave 1.5: Playwright (slow, browser launch) while slower sources also run
+  const bonusStages: Stage[] = [
+    { name: 'Playwright Browser', fn: () => stagePlaywrightMultiEngine(lat, lon, location), timeout: 20000 },
+    ...slowStages.filter(s => !s.skip),
+  ];
+  return await raceStages(bonusStages);
+}
+
+export async function getNearbyPhotoWikimedia(place: { lat: number; lon: number }, location?: any): Promise<Photo | null> {
+  return stageWikimediaGeosearch(place.lat, place.lon, location);
+}
+
+export async function getNearbyPhotoOpenverse(lat: number, lon: number, _radius?: number, location?: any): Promise<Photo | null> {
+  return stageOpenverse(lat, lon, location);
 }

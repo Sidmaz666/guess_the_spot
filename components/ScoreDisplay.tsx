@@ -13,6 +13,11 @@ interface ScoreDisplayProps {
 
 export default function ScoreDisplay({ result, gameData, playerGuess }: ScoreDisplayProps) {
   const [playerGuessDetails, setPlayerGuessDetails] = useState<string>('');
+  const [imageError, setImageError] = useState(false);
+
+  useEffect(() => {
+    setImageError(false);
+  }, [gameData?.image?.fileurl]);
 
   useEffect(() => {
     // Fetch location details for player's guess
@@ -143,7 +148,7 @@ export default function ScoreDisplay({ result, gameData, playerGuess }: ScoreDis
       </div>
 
       {/* Image Thumbnail Badge */}
-      {gameData?.image?.fileurl && (
+      {gameData?.image?.fileurl && !imageError && (
         <div className="absolute bottom-0 right-0 m-2 flex justify-center">
           <button
             onClick={handleImageClick}
@@ -157,6 +162,7 @@ export default function ScoreDisplay({ result, gameData, playerGuess }: ScoreDis
                 fill
                 className="object-cover"
                 sizes="96px"
+                onError={() => setImageError(true)}
               />
               <div className="absolute inset-0 bg-black/20 group-hover:bg-black/10 transition-colors duration-300" />
               <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300">
