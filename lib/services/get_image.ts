@@ -269,9 +269,9 @@ const SEARCH_ENGINES = [
 async function findChromiumPath(): Promise<string | null> {
   // 1) @sparticuz/chromium-min (Vercel/production — executablePath is async)
   try {
-    const cm = await import('@sparticuz/chromium-min');
-    const p = typeof cm.executablePath === 'function' ? await cm.executablePath() : cm.executablePath;
-    if (p && typeof p === 'string') return p;
+    const cm: any = await import('@sparticuz/chromium-min');
+    const ep = typeof cm.executablePath === 'function' ? await cm.executablePath() : cm.executablePath;
+    if (ep && typeof ep === 'string') return ep;
   } catch {}
 
   // 2) Playwright-installed chromium in ms-playwright cache
@@ -333,7 +333,7 @@ async function stagePlaywrightMultiEngine(lat: number, lon: number, location?: a
   let chromiumArgs: string[];
   try {
     playwright = await import('playwright-core');
-    const cm = await import('@sparticuz/chromium-min').catch(() => null);
+    const cm: any = await import('@sparticuz/chromium-min').catch(() => null);
     chromiumArgs = cm?.args ?? ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--headless'];
 
     const execPath = await findChromiumPath();
